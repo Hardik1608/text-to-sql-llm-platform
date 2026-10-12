@@ -1,5 +1,15 @@
 # Text-to-SQL LLM Platform
 
+
+
+https://github.com/user-attachments/assets/06fd9b75-4927-486c-bb74-6bb133ed5423
+
+
+
+
+
+
+
 > **Production-grade LLM customization platform** that measures when prompting, retrieval (RAG) and
 > PEFT fine-tuning (QLoRA) are the right engineering choice — applied to Text-to-SQL on the
 > [Spider](https://yale-lily.github.io/spider) benchmark, served behind a SQL safety layer.
@@ -22,7 +32,7 @@
 
 ## What This Project Demonstrates
 
-This is **not** a "fine-tune Llama" project. The engineering question is:
+The engineering question is:
 
 > *"Given a Text-to-SQL problem, when is prompting sufficient, when does RAG help, and when does
 > PEFT fine-tuning become necessary?"*
@@ -35,8 +45,8 @@ and in combination:
 | **Base model** (Qwen2.5-3B-Instruct) | `prompt` | `rag` |
 | **QLoRA adapter** (`spider-v1-e3`) | `qlora` | `qlora_rag` |
 
-Every mode runs through the **same production pipeline** — retrieval, generation, safety layer,
-guarded execution — so the benchmark measures the system that serves traffic.
+Every mode runs through the **same production pipeline** retrieval, generation, safety layer,
+guarded execution so the benchmark measures the system that serves traffic.
 
 ---
 
