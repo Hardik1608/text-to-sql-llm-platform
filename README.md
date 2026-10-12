@@ -8,6 +8,16 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+## 📚 Documentation
+| | |
+|---|---|
+| [📝 Case study](docs/CASE_STUDY.md) | Problem → prompting → RAG → QLoRA → serving → lessons learned |
+| [⚙️ Architecture](docs/ARCHITECTURE.md) | Request path, training pipeline, deployment topology |
+| [🏋️ Training on an RTX 3060](docs/TRAINING_RTX3060.md) | Memory plan, time budget, step-by-step run, troubleshooting |
+| [🐳 Running the stack](infra/README.md) | Docker Compose profiles (`gpu` / `cpu` / `tracking`), ports, alerts |
+| [📊 Results](docs/results/) | Test and dev benchmarks, checkpoint selection, vLLM serving, Docker check |
+| [🔌 API](#api) | Endpoints and the web UI (interactive docs at `/docs` when running) |
+
 ---
 
 ## What This Project Demonstrates
@@ -23,7 +33,7 @@ and in combination:
 | | Full schema | Retrieval-augmented context |
 |---|---|---|
 | **Base model** (Qwen2.5-3B-Instruct) | `prompt` | `rag` |
-| **QLoRA adapter** (`spider-v1`) | `qlora` | `qlora_rag` |
+| **QLoRA adapter** (`spider-v1-e3`) | `qlora` | `qlora_rag` |
 
 Every mode runs through the **same production pipeline** — retrieval, generation, safety layer,
 guarded execution — so the benchmark measures the system that serves traffic.
@@ -179,14 +189,27 @@ pip install -r requirements-train.txt                 # GPU box (torch with CUDA
 # SFT data from Spider train: same ContextBuilder as inference, validation held out BY DATABASE
 python -m src.finetuning.prepare_data                 # -> data/finetune/{train,val}.jsonl
 
-# QLoRA (4-bit NF4, r=16, alpha=32); tracks to MLflow; writes a vLLM-loadable adapter
-python -m src.finetuning.train_lora --epochs 2 --output adapters/spider-v1
+# QLoRA (4-bit NF4, r=16, alpha=32, 3 epochs); tracks to MLflow; writes a vLLM-loadable adapter
+python -m src.finetuning.train_lora --epochs 3 --output adapters/spider-v1-e3
 
 # 4-way benchmark through the production pipeline
-python -m src.evaluation.compare_approaches --split dev --adapter spider-v1 --mlflow
+python -m src.evaluation.compare_approaches --split test --adapter spider-v1-e3 --mlflow
 ```
 
-Hardware notes, memory plan, time budget and troubleshooting: [`docs/TRAINING_RTX3060.md`](docs/TRAINING_RTX3060.md).
+The served adapter is the **final** weights, not the lowest-validation-loss checkpoint: loss picked
+step 100, which scored 8 points lower on execution accuracy
+([`training_and_selection.md`](docs/results/training_and_selection.md)).
+
+To serve it, put the adapter folder at `adapters/spider-v1-e3/` (it must contain
+`adapter_config.json`) and set this in `.env`:
+
+```bash
+T2S_ADAPTERS=spider-v1-e3=/adapters/spider-v1-e3
+```
+
+`scripts/gpu_train.sh` runs the whole GPU flow in stages (`setup`, `data`, `smoke`, `probe`,
+`train`, `eval`). Hardware notes, memory plan, time budget and troubleshooting:
+[`docs/TRAINING_RTX3060.md`](docs/TRAINING_RTX3060.md).
 
 ---
 
@@ -228,7 +251,9 @@ It is three static files in `api/static/`, served by the same container, with no
 
 ```
 text-to-sql-llm-platform/
-├── api/main.py                  # FastAPI gateway
+├── api/
+│   ├── main.py                  # FastAPI gateway
+│   └── static/                  # web UI: index.html, app.js, styles.css (no build step)
 ├── src/
 │   ├── schema.py                # structured schema model shared by every stage
 │   ├── pipeline.py              # route → cache → retrieve → generate → validate → repair → execute
@@ -237,14 +262,19 @@ text-to-sql-llm-platform/
 │   ├── retrieval/               # BM25, schema pruning, example retrieval, value index, context builder
 │   ├── generation/              # prompt templates (4 modes), SQL extraction
 │   ├── safety/                  # sql_validator.py (stages 1-3), executor.py (stage 4)
-│   ├── serving/                 # vLLM client + adapter registry, Redis cache, metrics, hf_server
+│   ├── serving/                 # vLLM client + adapter registry, Redis cache, metrics,
+│   │                            #   4-way comparison (compare.py), hf_server
 │   ├── finetuning/              # prepare_data.py, train_lora.py
 │   └── evaluation/              # metrics (EX, EM, hardness), compare_approaches.py
-├── tests/                       # unit + integration (mini-Spider, fake LLM) + real-Spider regression
+├── tests/                       # 140 tests: unit + integration (mini-Spider, fake LLM)
+│                                #   + real-Spider regression
+├── scripts/gpu_train.sh         # staged GPU run: setup → data → smoke → probe → train → eval
 ├── notebooks/benchmark_analysis.ipynb
 ├── docs/                        # CASE_STUDY.md, ARCHITECTURE.md, TRAINING_RTX3060.md
+│   └── results/                 # benchmark, training, serving and Docker evidence
 ├── infra/                       # prometheus.yml, alerts.yml, README (how to run each profile)
 ├── monitoring/grafana/          # provisioned datasource + dashboard
+├── adapters/                    # LoRA adapters (git-ignored; produced by training)
 ├── docker-compose.yml, Dockerfile, Makefile
 └── .github/workflows/ci.yml
 ```
