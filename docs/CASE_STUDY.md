@@ -1,4 +1,4 @@
-# Case Study — When Do Prompting, RAG and Fine-Tuning Pay Off? A Text-to-SQL Platform
+# Case Study: When Do Prompting, RAG and Fine-Tuning Pay Off? A Text-to-SQL Platform
 
 **Author:** Hardik Soni · **Stack:** Qwen2.5-3B-Instruct, PEFT/QLoRA, TRL, vLLM, FastAPI, sqlglot, Redis, MLflow, Prometheus/Grafana
 
@@ -15,23 +15,17 @@ system must (a) understand the question, (b) map it onto an unfamiliar schema, (
 is valid *and* means the right thing, and (d) never damage or leak data — LLM output is
 untrusted input that will be executed against a database.
 
-The engineering question behind this project is narrower and more useful than "build a chatbot":
-**for this task, how much does each customization technique buy — prompting, retrieval, PEFT
-fine-tuning — and what does each cost?** It is the most common GenAI design question in
-interviews ("RAG or fine-tuning?") answered with measurements instead of opinions.
+The question behind this project: **for this task, how much does each customization technique
+buy (prompting, retrieval, PEFT fine-tuning), and what does each cost?** "RAG or fine-tuning?"
+is usually answered with opinions; here it is answered with measurements.
 
 ## 2. Why prompting alone falls short
 
-A 3B instruction model with a good prompt is a strong baseline, and the system prompt + static
-few-shot examples in `src/generation/prompts.py` are deliberately reasonable. Known failure
-modes it cannot fix by itself:
-
-- **Schema linking** — picking `singer.Name` vs `concert.concert_Name`, or the right join path
-  through bridge tables.
-- **Literal grounding** — the database stores `'United States'`, the user typed "USA"; years
-  stored as TEXT (`'2014'`) vs numbers.
-- **Output discipline** — markdown fences, explanations, or a second statement appended to the SQL.
-- **Spider-style conventions** — `T1`/`T2` aliasing, `GROUP BY` + `ORDER BY count(*) DESC LIMIT 1` for "the most".
+The prompt-mode baseline (system prompt + static few-shot examples in
+`src/generation/prompts.py`) is deliberately reasonable. It still cannot fix schema linking
+(`singer.Name` vs `concert.concert_Name`, join paths through bridge tables), literal grounding
+(the database stores `'United States'`, the user typed "USA") or output discipline (markdown
+fences, prose, a second statement).
 
 One design decision matters here: in *every* mode the model sees the target schema. An earlier
 draft gave the prompt-only mode no schema at all. That turns the comparison into a strawman,
@@ -62,19 +56,11 @@ Two details make these work:
 
 ## 4. Why and when PEFT helps
 
-Fine-tuning changes *behaviour*, not knowledge. A QLoRA adapter trained on 8k Spider pairs is
-expected to improve:
-
-- **Conventions and format** — a consistent SQL dialect and style, no prose, no fences, correct
-  `GROUP BY` / `HAVING` patterns.
-- **Schema reading** — the adapter cannot memorise unseen databases, but it learns to use the
-  schema it is shown, especially PK/FK lines for joins.
-- **Cost** — the full-schema `qlora` prompt carries no few-shot examples, so it is shorter than
-  `rag`.
-
-It should *not* be expected to fix literal grounding (the data changes; only retrieval sees
-it), and it adds training cost plus an artifact to version and serve. The hypothesis to test:
-**the combination wins**. Fine-tuning brings behaviour and retrieval brings grounding.
+Fine-tuning changes *behaviour*, not knowledge. The adapter cannot memorise unseen databases, but
+it can learn SQL conventions and how to read the schema it is shown, and it removes the need for
+few-shot examples in the prompt. It cannot fix literal grounding (only retrieval sees the data),
+and it adds training cost plus an artifact to version and serve. The hypothesis to test: **the
+combination wins**. Fine-tuning brings behaviour and retrieval brings grounding.
 
 | | Full schema | Retrieval-augmented |
 |---|---|---|
@@ -166,7 +152,7 @@ Key decisions:
 
 ## 9. Evaluation methodology
 
-`src/evaluation/compare_approaches.py` runs every dev question through the **production
+`src/evaluation/compare_approaches.py` runs every question of a split through the **serving
 pipeline** in each mode (no cache, no repair by default), then computes:
 
 | Metric | Definition |
@@ -183,14 +169,16 @@ pipeline** in each mode (no cache, no repair by default), then computes:
 - The hardness classifier reproduces the official dev distribution within a few questions: **248/444/187/155** vs official **248/446/174/166**.
 - Gold-vs-gold exact match is **100%**.
 
-Statistics: n=1,034 gives a 95% CI of about ±2.8 points at 70% accuracy. Differences under
-about 3 points between modes are therefore not claimed as wins.
+Statistics: at about 70% accuracy, the 95% CI is about ±1.9 points on test (n=2,147) and ±2.8
+points on dev (n=1,034). Differences inside the interval are not claimed as wins. The modes are
+scored on the same questions, so a paired test (McNemar) is the stricter check and is the next
+addition to the harness.
 
 ## 10. Serving architecture
 
 - **vLLM** serves the base model once and selects LoRA adapters *per request* through the
-  OpenAI `model` field. One GPU serves `base`, `spider-v1` and `spider-v2` side by side
-  (multi-tenant, A/B between adapter versions).
+  OpenAI `model` field. One GPU can serve the base model and several adapter versions side by
+  side (multi-tenant, A/B between adapter versions); `VLLM_MAX_LORAS` sets how many.
 - **Hot-swap without restart.** `VLLM_ALLOW_RUNTIME_LORA_UPDATING` exposes
   `/v1/load_lora_adapter`. The API wraps it as `POST /adapters/load`, behind `X-Admin-Token`.
 - **Adapter registry** (`src/serving/vllm_client.py`): versioned names, a default adapter, and
@@ -320,16 +308,11 @@ Interval: at n=2,147 and ~70% accuracy, the 95% confidence interval is ±1.9 poi
 - Continuous batching gives 5× throughput at 16 parallel requests, at 3× the median latency.
 - Accuracy is the same across concurrency levels, and the same as on the reference server.
 
-**Pipeline validation run (measured, not the target model):**
-- Setup: `llama3.2` 3B, Q4, Ollama on a CPU laptop; 50 random dev questions (seed 7).
-- Result: prompt **64%** → rag **74%** execution accuracy.
-- Gains came on easy, medium and hard questions. Extra-hard stayed at 22% in both modes.
-
-At n=50 this proves the harness works end to end; it is not evidence about Qwen or QLoRA.
-
 ## 14. Failure modes
 
-Expected error taxonomy. Confirm it on the GPU run with `notebooks/benchmark_analysis.ipynb`.
+The failure classes the system is designed against, with the mitigation for each. The measured
+rates are in §3 (value-hint coverage) and §13 (hallucination, valid SQL, repair). A per-class
+breakdown of the test errors is not done yet.
 
 | Failure | Example | Mitigation in this system |
 |---|---|---|
@@ -351,17 +334,11 @@ Expected error taxonomy. Confirm it on the GPU run with `notebooks/benchmark_ana
 - **Self-repair:** +1.9 points of accuracy for +11% tokens and a second LLM call on about 5–7% of
   questions. That's a good price when wrong answers cost more than tokens.
 
-- **Tokens.**
-  - RAG adds about 3 examples (~150–250 tokens) but prunes the schema.
-  - Full-schema QLoRA prompts are the shortest (no few-shot).
-  - Prompt-mode static few-shot costs about 250 tokens on every call.
-  - Measured CPU smoke run: 572 mean prompt tokens for prompt mode, 504 for rag mode
-    (llama3.2 tokenizer).
 - **Retrieval overhead** is negligible next to generation: routing 0.5 ms, examples 2.8 ms,
   value hints 0.3 ms, validation about 4 ms.
 - **Tokens, measured on test:** prompting 577, RAG 491, QLoRA **354**, QLoRA + RAG 491 mean
-  prompt tokens. The adapter learned the conventions that few-shot examples otherwise teach, so
-  it needs the shortest prompt.
+  prompt tokens. RAG adds about 3 retrieved examples but prunes the schema. The adapter learned
+  the conventions that few-shot examples otherwise teach, so it needs the shortest prompt.
 - **Training cost.** One overnight run on a consumer GPU (8.5 h, 6.29 GB peak VRAM), amortized over every
   query after it. Retraining is needed only when SQL conventions change, not when data
   changes; that's retrieval's job.

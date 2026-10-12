@@ -60,7 +60,6 @@ flowchart LR
     VL --> CMP
     CMP --> REP[(reports/run<br/>summary.md/json<br/>predictions_*.jsonl)]
     CMP -.-> M
-    REP --> NB[benchmark_analysis.ipynb]
 ```
 
 ## 3. Deployment topology (`docker compose`)

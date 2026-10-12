@@ -1,38 +1,28 @@
 # Text-to-SQL LLM Platform
 
-
+> Measures when prompting, retrieval (RAG) and QLoRA fine-tuning pay off for Text-to-SQL.
+> Qwen2.5-3B on one RTX 3060: **63.4% → 76.1%** execution accuracy on the
+> [Spider](https://yale-lily.github.io/spider) test set, served on vLLM behind a SQL safety layer.
 
 https://github.com/user-attachments/assets/06fd9b75-4927-486c-bb74-6bb133ed5423
-
-
-
-
-
-
-
-> **Production-grade LLM customization platform** that measures when prompting, retrieval (RAG) and
-> PEFT fine-tuning (QLoRA) are the right engineering choice — applied to Text-to-SQL on the
-> [Spider](https://yale-lily.github.io/spider) benchmark, served behind a SQL safety layer.
 
 [![CI](https://github.com/Hardik1608/text-to-sql-llm-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Hardik1608/text-to-sql-llm-platform/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 📚 Documentation
+## Documentation
 | | |
 |---|---|
-| [📝 Case study](docs/CASE_STUDY.md) | Problem → prompting → RAG → QLoRA → serving → lessons learned |
-| [⚙️ Architecture](docs/ARCHITECTURE.md) | Request path, training pipeline, deployment topology |
-| [🏋️ Training on an RTX 3060](docs/TRAINING_RTX3060.md) | Memory plan, time budget, step-by-step run, troubleshooting |
-| [🐳 Running the stack](infra/README.md) | Docker Compose profiles (`gpu` / `cpu` / `tracking`), ports, alerts |
-| [📊 Results](docs/results/) | Test and dev benchmarks, checkpoint selection, vLLM serving, Docker check |
-| [🔌 API](#api) | Endpoints and the web UI (interactive docs at `/docs` when running) |
+| [Case study](docs/CASE_STUDY.md) | Design decisions, results, failure modes, lessons learned |
+| [Architecture](docs/ARCHITECTURE.md) | Request path, training pipeline, deployment topology |
+| [Training on an RTX 3060](docs/TRAINING_RTX3060.md) | Memory plan, time budget, step-by-step run, troubleshooting |
+| [Running the stack](infra/README.md) | Docker Compose profiles (`gpu` / `cpu` / `tracking`), ports, alerts |
+| [Results](docs/results/) | Test and dev benchmarks, checkpoint selection, vLLM serving, Docker check |
+| [API](#api) | Endpoints and the web UI (interactive docs at `/docs` when running) |
 
 ---
 
-## What This Project Demonstrates
-
-The engineering question is:
+## The Question
 
 > *"Given a Text-to-SQL problem, when is prompting sufficient, when does RAG help, and when does
 > PEFT fine-tuning become necessary?"*
@@ -45,8 +35,9 @@ and in combination:
 | **Base model** (Qwen2.5-3B-Instruct) | `prompt` | `rag` |
 | **QLoRA adapter** (`spider-v1-e3`) | `qlora` | `qlora_rag` |
 
-Every mode runs through the **same production pipeline** retrieval, generation, safety layer,
-guarded execution so the benchmark measures the system that serves traffic.
+Every mode runs through the **same serving pipeline**: retrieval, generation, safety layer and
+guarded execution. The benchmark therefore measures the system that answers requests, not a
+separate evaluation script.
 
 ---
 
@@ -79,24 +70,26 @@ Full diagrams (request path, training pipeline, deployment topology): [`docs/ARC
 **Spider test set: 2,147 questions on 40 databases that the model never saw.** Qwen2.5-3B-Instruct
 ran on one RTX 3060. No repair retries were used.
 
-| Approach | Execution Acc. | Exact Match | Valid SQL | P95 latency | Prompt tokens |
-|---|---|---|---|---|---|
-| Base + Prompting | 63.4% | 29.0% | 87.4% | 1.9 s | 577 |
-| Base + Schema RAG | 66.9% | 38.5% | 88.0% | 1.9 s | 491 |
-| QLoRA Fine-Tuned | 72.9% | 50.1% | 92.9% | 2.3 s | 354 |
-| **QLoRA + Schema RAG** | **76.1%** | **50.0%** | **93.0%** | 2.5 s | 491 |
+| Approach | Execution Acc. | Exact Match | Valid SQL | Prompt tokens |
+|---|---|---|---|---|
+| Base + Prompting | 63.4% | 29.0% | 87.4% | 577 |
+| Base + Schema RAG | 66.9% | 38.5% | 88.0% | 491 |
+| QLoRA Fine-Tuned | 72.9% | 50.1% | 92.9% | 354 |
+| **QLoRA + Schema RAG** | **76.1%** | **50.0%** | **93.0%** | 491 |
 
-- **QLoRA + schema RAG: +12.7 points** of execution accuracy over prompting (63.4% → 76.1%).
-  The 95% confidence interval at n=2,147 is about ±2 points.
-- **Fine-tuning gives the largest gain** (+9.5 points over prompting). RAG adds +3.5 points on
-  the base model and +3.2 points on the adapter.
-- **The gains grow with query difficulty.** On *hard* questions, accuracy rose from 50.6% to 68.5%. On
-  *extra* questions, it rose from 47.7% to 59.5%.
-- **The adapter needs the shortest prompt:** 354 tokens vs 577 for prompting, 39% fewer.
-- The latency in this table comes from the sequential reference server (`hf_server.py`). vLLM
-  numbers are below.
-- **One self-repair retry raises accuracy to 78.0%** (+1.9 points). It also cuts hallucinated
-  identifiers from 6.9% to 4.6%.
+- **Fine-tuning gives the largest gain:** +9.5 points over prompting. Schema RAG adds +3.5 points
+  on the base model and +3.2 points on the adapter. Combined: **+12.7 points**.
+- **The gains grow with difficulty:** on *hard* questions, 50.6% → 68.5%.
+- **Validation loss picked the wrong checkpoint.** The lowest-loss checkpoint (step 100) scored
+  67.5% on 200 dev questions; the final weights scored 75.5%, although their loss was 2× higher.
+  The final weights are served.
+- **One self-repair retry raises accuracy to 78.0%** and cuts hallucinated identifiers from 6.9%
+  to 4.6%.
+
+For scale: the best GPT-4-based systems score about 86% on the same test set
+([DAIL-SQL](https://arxiv.org/abs/2308.15363): 86.6%). This project uses a 3B open model that is
+trained and served on one 12 GB consumer GPU. Spider 1.0 is close to saturated, so
+[BIRD](https://bird-bench.github.io/) is the next benchmark for this pipeline.
 
 | Serving on vLLM (one RTX 3060, QLoRA + RAG, 500 dev questions) | Throughput | P50 | P95 | Exec Acc |
 |---|---|---|---|---|
@@ -109,32 +102,21 @@ ran on one RTX 3060. No repair retries were used.
 | Peak VRAM | **6.29 GB** |
 | Trainable parameters | 29.9M (0.96% of 3.1B) |
 
-Evidence:
-- [`docs/results/spider_test_summary.md`](docs/results/spider_test_summary.md): the test split
-  (the headline, used for no decision).
-- [`docs/results/spider_dev_summary.md`](docs/results/spider_dev_summary.md): the dev split.
-  QLoRA + schema RAG scored 75.2%. Dev is slightly optimistic, because 200 dev questions selected the checkpoint.
-- [`docs/results/training_and_selection.md`](docs/results/training_and_selection.md): the training
-  run and the checkpoint choice.
-- [`docs/results/vllm_serving_and_repair.md`](docs/results/vllm_serving_and_repair.md): vLLM
-  throughput and the self-repair ablation.
-- [`docs/results/docker_stack_check.md`](docs/results/docker_stack_check.md): the full Docker
-  Compose stack (API, vLLM with the LoRA adapter, Redis, Prometheus, Grafana), checked end to end
-  on the GPU box.
+Raw reports, latency per approach, accuracy by difficulty, the dev split and the Docker stack
+check: [`docs/results/`](docs/results/). The test split was used for no decision.
 
-### Already measured (reproducible on a CPU laptop)
+### Component checks (reproducible on a CPU laptop)
 
-| What | Result | Reproduce |
-|---|---|---|
-| Validator false-rejection rate on **9,693** Spider gold queries (train + dev) | **0.01%** (1 query — a Spider annotation referencing a table missing from the schema) | `pytest tests/test_real_spider.py` |
-| Re-serialized `safe_sql` returns the same result as the original | **100%** of executable gold queries | same |
-| Mean validation latency (parse + read-only + schema allowlist) | **~4 ms** | |
-| DB routing over 206 databases (no `db_id` given) | top-1 **78.3%**, top-3 **89.0%**, 0.5 ms | |
-| Table-pruning recall (gold tables kept), `max_tables=6` + FK expansion | **100%** dev / **97.6%** train | |
-| Value hints cover the string literals of gold SQL | **82.5%** (dev) | |
-| Few-shot example retrieval latency (8,659-example index) | **2.8 ms** | |
-| Pipeline smoke run — `llama3.2` 3B (Q4, CPU, *not the target model*), 50 random dev questions | prompt **64%** → RAG **74%** execution accuracy | `compare_approaches --limit 50 --sample --seed 7` |
-| Checkpoint chosen by validation loss vs by the final weights (200 dev questions) | lowest-loss step 100: **67.5%**; final step 1557: **75.5%** (loss 0.20 → 0.40) | [`training_and_selection.md`](docs/results/training_and_selection.md) |
+| What | Result |
+|---|---|
+| Validator false rejections on **9,693** Spider gold queries (train + dev) | **0.01%** (1 query: a Spider annotation that names a table missing from the schema) |
+| Re-serialized `safe_sql` returns the same result as the original | **100%** of executable gold queries |
+| Validation latency (parse + read-only + schema allowlist) | **~4 ms** mean |
+| Database routing over 206 databases (no `db_id` given) | top-1 **78.3%**, top-3 **89.0%** |
+| Table-pruning recall (gold tables kept), `max_tables=6` + FK expansion | **100%** dev / **97.6%** train |
+
+The validator rows are reproduced by `pytest tests/test_real_spider.py` (it needs the Spider
+download).
 
 ---
 
@@ -279,7 +261,6 @@ text-to-sql-llm-platform/
 ├── tests/                       # 140 tests: unit + integration (mini-Spider, fake LLM)
 │                                #   + real-Spider regression
 ├── scripts/gpu_train.sh         # staged GPU run: setup → data → smoke → probe → train → eval
-├── notebooks/benchmark_analysis.ipynb
 ├── docs/                        # CASE_STUDY.md, ARCHITECTURE.md, TRAINING_RTX3060.md
 │   └── results/                 # benchmark, training, serving and Docker evidence
 ├── infra/                       # prometheus.yml, alerts.yml, README (how to run each profile)
@@ -291,18 +272,9 @@ text-to-sql-llm-platform/
 
 ---
 
-## Portfolio Case Study
+## Case Study
 
-[`docs/CASE_STUDY.md`](docs/CASE_STUDY.md) follows the problem through to production:
-problem → prompting limitations → why RAG helps → why and when PEFT helps → dataset → model
-selection → QLoRA config → training pipeline → evaluation → serving → safety → observability →
-benchmarks → failure modes → cost/latency trade-offs → lessons learned → what changes at 10×
+[`docs/CASE_STUDY.md`](docs/CASE_STUDY.md) covers the decisions behind the system: dataset and
+model choice, QLoRA configuration, evaluation method, serving, safety, observability, benchmark
+results, failure modes, cost and latency trade-offs, lessons learned, and what changes at 10×
 traffic.
-
----
-
-## Skills Demonstrated
-
-`LLMs` `PEFT` `LoRA` `QLoRA` `SFT` `Transformers` `PyTorch` `RAG` `BM25` `SQL` `sqlglot` `FastAPI`
-`vLLM` `Docker` `Redis` `MLflow` `Prometheus` `Grafana` `CI/CD` `LLM Evaluation` `Model Versioning`
-`Production Safety` `ML System Design`
