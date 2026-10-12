@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: jobs only read the repository.
+permissions:
+  contents: read
+
+# One run per PR / branch; a newer push cancels the superseded run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_PROGRESS_BAR: "off"
+  PYTHONUNBUFFERED: "1"
+  FORCE_COLOR: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev tools
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check --output-format=github src api tests
+
+      - name: ruff format --check
+        run: ruff format --check src api tests
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # Hermetic: no GPU, LLM backend, Redis or Spider data in CI. Tests marked
+      # `spider` skip themselves when data/ is absent.
+      - name: Run tests
+        run: pytest -q --cov=src --cov=api --cov-report=xml --cov-report=term
+
+      - name: Upload coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  config:
+    name: Validate infra config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: docker compose config (defaults + .env.example, every profile)
+        run: |
+          docker compose version
+          docker compose config -q
+          for profile in gpu cpu tracking; do
+            echo "profile: $profile"
+            docker compose --profile "$profile" config -q
+            docker compose --env-file .env.example --profile "$profile" config -q
+          done
+
+      # Use the exact Prometheus image the stack runs, read from docker-compose.yml.
+      - name: promtool check config + rules
+        run: |
+          PROM_IMAGE="$(docker compose config --images | grep '^prom/prometheus:')"
+          echo "Using ${PROM_IMAGE}"
+          docker run --rm -v "${PWD}/infra:/etc/prometheus:ro" --entrypoint promtool \
+            "${PROM_IMAGE}" check config /etc/prometheus/prometheus.yml
+          docker run --rm -v "${PWD}/infra:/etc/prometheus:ro" --entrypoint promtool \
+            "${PROM_IMAGE}" check rules /etc/prometheus/alerts.yml
+
+      - name: Validate Grafana dashboards
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, re, sys
+
+          ds_file = pathlib.Path("monitoring/grafana/provisioning/datasources/datasource.yml")
+          ds_uid = re.search(r"^\s*uid:\s*(\S+)", ds_file.read_text(), re.M).group(1)
+          failed = False
+          for path in sorted(pathlib.Path("monitoring/grafana/dashboards").glob("*.json")):
+              problems = []
+              try:
+                  dash = json.loads(path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError as exc:
+                  problems.append(f"invalid JSON: {exc}")
+                  dash = {}
+              for key in ("uid", "title", "schemaVersion", "panels"):
+                  if key not in dash:
+                      problems.append(f"missing '{key}'")
+              panels = dash.get("panels", [])
+              ids = [p.get("id") for p in panels]
+              if len(ids) != len(set(ids)):
+                  problems.append("duplicate panel ids")
+              for p in panels:
+                  if p.get("type") == "row":
+                      continue
+                  grid = p.get("gridPos", {})
+                  if grid.get("x", 0) + grid.get("w", 0) > 24:
+                      problems.append(f"panel {p.get('id')} wider than 24 columns")
+                  uids = {p.get("datasource", {}).get("uid")}
+                  uids |= {t.get("datasource", {}).get("uid") for t in p.get("targets", [])}
+                  if uids - {ds_uid, "${datasource}"}:
+                      problems.append(f"panel {p.get('id')} uses datasource {uids}, expected '{ds_uid}'")
+                  if not all(t.get("expr") for t in p.get("targets", [])):
+                      problems.append(f"panel {p.get('id')} has a target without expr")
+              status = "OK  " if not problems else "FAIL"
+              print(f"{status} {path} ({len(panels)} panels)")
+              for problem in problems:
+                  print(f"     - {problem}")
+              failed |= bool(problems)
+          sys.exit(1 if failed else 0)
+          EOF
+
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Build API image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: text2sql-api:ci
+          build-args: |
+            APP_VERSION=ci-${{ github.sha }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=text2sql-api
+          cache-to: type=gha,mode=max,scope=text2sql-api
+
+      # The image must run as non-root and import the app without data,
+      # network or a GPU (heavy initialisation belongs in the FastAPI lifespan).
+      - name: Smoke-test image
+        run: |
+          uid="$(docker run --rm --entrypoint id text2sql-api:ci -u)"
+          echo "container uid: ${uid}"
+          test "${uid}" != "0"
+          docker run --rm \
+            -e T2S_LLM_BASE_URL=http://127.0.0.1:9/v1 \
+            -e T2S_REDIS_URL=redis://127.0.0.1:6379/0 \
+            -e T2S_CACHE_ENABLED=false \
+            -e T2S_ADMIN_TOKEN=ci \
+            text2sql-api:ci python -c "import api.main; print('api.main imports OK')"

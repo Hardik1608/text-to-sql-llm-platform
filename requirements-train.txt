@@ -1,0 +1,11 @@
+# QLoRA fine-tuning (GPU box, e.g. RTX 3060 12 GB). Install a CUDA build of torch first:
+#   Linux: pip install torch (wheels bundle CUDA). Windows: add --index-url https://download.pytorch.org/whl/cu128
+-r requirements.txt
+torch>=2.3
+transformers>=4.46
+peft>=0.13
+trl>=0.19
+bitsandbytes>=0.43   # official Windows + Linux wheels since 0.43
+accelerate>=1.0
+datasets>=3.0
+mlflow>=2.16

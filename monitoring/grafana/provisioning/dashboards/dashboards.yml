@@ -1,0 +1,21 @@
+# Grafana dashboard provisioning: loads every JSON file from
+# monitoring/grafana/dashboards (mounted at /etc/grafana/dashboards) into the
+# "Text2SQL" folder and re-reads the directory every 30s, so edits to the JSON
+# files show up without restarting Grafana.
+apiVersion: 1
+
+providers:
+  - name: text2sql
+    orgId: 1
+    folder: Text2SQL
+    folderUid: text2sql
+    type: file
+    disableDeletion: true
+    # UI edits can be saved for experimenting, but the JSON file stays the
+    # source of truth: the next change to the file replaces them. Export the
+    # dashboard JSON back into the repo to keep a change.
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

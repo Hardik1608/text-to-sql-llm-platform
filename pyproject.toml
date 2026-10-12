@@ -1,0 +1,35 @@
+[project]
+name = "text-to-sql-llm-platform"
+version = "0.2.0"
+description = "Production Text-to-SQL platform comparing prompting, schema RAG and QLoRA fine-tuning on Spider"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Hardik Soni" }]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["notebooks", "data", "adapters", "runs", "reports", "mlruns"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]  # long strings/comments are allowed; the formatter handles code
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "api"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "spider: requires the real Spider dataset under data/ (skipped otherwise)",
+]
+filterwarnings = [
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.coverage.run]
+source = ["src", "api"]
+omit = ["src/finetuning/*", "src/serving/hf_server.py"]  # need torch (GPU box)

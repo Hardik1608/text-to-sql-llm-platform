@@ -1,0 +1,10 @@
+# Serving + evaluation (CPU-only; what the API Docker image installs)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+httpx>=0.27
+numpy>=1.24          # BM25 scoring (src/retrieval/bm25.py)
+sqlglot>=25.0
+redis>=5.0
+prometheus-client>=0.20

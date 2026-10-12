@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Data, models, experiment outputs (large / reproducible)
+data/raw/
+data/processed/
+data/finetune/
+adapters/
+runs/
+mlruns/
+mlflow.db
+reports/*
+!reports/.gitkeep
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Env / secrets
+.env
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+grafana_snaps/details.png
+grafana_snaps/live.png
+grafana_snaps/Text_to_SQL.mp4

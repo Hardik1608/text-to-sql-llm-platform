@@ -1,0 +1,329 @@
+# =============================================================================
+# Text-to-SQL LLM platform - local deployment stack
+#
+#   core (no profile)    api, redis, redis-exporter, prometheus, grafana
+#   --profile gpu        vllm   - Qwen2.5-3B-Instruct + LoRA hot-swap (NVIDIA GPU)
+#   --profile cpu        ollama - CPU dev backend (+ one-shot model pull);
+#                                 prompt/rag modes only, LoRA modes need vLLM
+#   --profile tracking   mlflow - experiment + adapter tracking server
+#
+# Usage: make up-gpu | make up-cpu | make up-tracking | make down
+#        (see infra/README.md). Every ${VAR:-default} can be overridden in .env
+#        (cp .env.example .env).
+# =============================================================================
+name: text2sql
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------------------
+  # FastAPI gateway: prompt | rag | qlora | qlora_rag
+  # Deliberately no depends_on on the LLM backend: the API starts immediately,
+  # GET /health is liveness, and GET /ready returns 503 until the backend at
+  # T2S_LLM_BASE_URL answers (vLLM can take minutes to download/load weights).
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: text2sql-api:${APP_VERSION:-dev}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      T2S_LLM_BASE_URL: ${T2S_LLM_BASE_URL:-http://vllm:8000/v1}
+      T2S_LLM_API_KEY: ${T2S_LLM_API_KEY:-EMPTY}
+      # Must equal the model name the backend serves (vLLM: the model id).
+      T2S_BASE_MODEL: ${T2S_BASE_MODEL:-${VLLM_MODEL:-Qwen/Qwen2.5-3B-Instruct}}
+      T2S_REDIS_URL: ${T2S_REDIS_URL:-redis://redis:6379/0}
+      T2S_CACHE_ENABLED: ${T2S_CACHE_ENABLED:-true}
+      T2S_CACHE_TTL_SECONDS: ${T2S_CACHE_TTL_SECONDS:-3600}
+      T2S_DATA_DIR: /app/data
+      # name=path pairs. Paths are container paths under /adapters, identical in
+      # the api and vllm containers (both mount ./adapters there).
+      T2S_ADAPTERS: ${T2S_ADAPTERS-spider-v1=/adapters/spider-v1}
+      # Empty = adapter admin endpoints disabled (secure default); set in .env.
+      T2S_ADMIN_TOKEN: ${T2S_ADMIN_TOKEN:-}
+      T2S_LOG_LEVEL: ${T2S_LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data:ro
+      - ./adapters:/adapters:ro
+    extra_hosts:
+      # Lets T2S_LLM_BASE_URL=http://host.docker.internal:<port>/v1 reach an LLM
+      # server running on the host (also on Linux, where it is not built in).
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Hardening: immutable root FS (only /tmp is writable), no Linux
+    # capabilities, no privilege escalation. Port 8000 needs no capabilities.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Redis: query-result cache. Pure LRU cache: bounded memory, no persistence.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      # Loopback only: Redis has no auth here, never expose it on the LAN.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.93.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Monitoring: Prometheus (metrics + alert rules) and Grafana (dashboards)
+  # Reload Prometheus config/rules without a restart:
+  #   docker compose kill -s SIGHUP prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:12.4.12
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # Admin credentials apply on first start only (then stored in grafana-data).
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/text2sql-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # profile gpu: vLLM OpenAI-compatible server with multi-LoRA serving.
+  # Image default is CUDA 13 (NVIDIA driver >= 580). For older drivers set
+  # VLLM_IMAGE=vllm/vllm-openai:v0.31.0-cu129 in .env.
+  # ---------------------------------------------------------------------------
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.31.0}
+    profiles: ["gpu"]
+    ports:
+      - "${VLLM_PORT:-8001}:8000"
+    ipc: host
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Enables POST /v1/load_lora_adapter + /v1/unload_lora_adapter (hot-swap).
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+      # FlashInfer compiles its sampler on first use and needs nvcc. The PyTorch sampler gives
+      # identical results with greedy decoding (temperature 0), so skip the compile.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+      T2S_ADAPTERS: ${T2S_ADAPTERS-spider-v1=/adapters/spider-v1}
+    volumes:
+      - ./adapters:/adapters:ro
+      - hf-cache:/root/.cache/huggingface
+      - vllm-cache:/root/.cache/vllm
+    # Wrapper around `vllm serve` that turns T2S_ADAPTERS into --lora-modules,
+    # skipping adapters not on disk yet so a fresh clone still serves the base
+    # model. ($$ escapes compose interpolation; ${VLLM_*} come from .env.)
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        lora_args=()
+        IFS=',' read -r -a specs <<< "$${T2S_ADAPTERS:-}"
+        for spec in "$${specs[@]}"; do
+          spec="$${spec//[[:space:]]/}"
+          case "$$spec" in
+            *=*) ;;
+            "") continue ;;
+            *) echo "[vllm-entrypoint] skip '$$spec': expected name=/adapters/<name>" >&2; continue ;;
+          esac
+          path="$${spec#*=}"
+          if [[ -f "$$path/adapter_config.json" ]]; then
+            lora_args+=("$$spec")
+          else
+            echo "[vllm-entrypoint] skip LoRA '$$spec': $$path/adapter_config.json not found (hot-load it later via POST /v1/load_lora_adapter)" >&2
+          fi
+        done
+        args=(
+          "${VLLM_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
+          --host 0.0.0.0
+          --port 8000
+          --enable-lora
+          --max-lora-rank "${VLLM_MAX_LORA_RANK:-16}"
+          --max-loras "${VLLM_MAX_LORAS:-4}"
+          --max-model-len "${VLLM_MAX_MODEL_LEN:-4096}"
+          --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+          --generation-config vllm
+        )
+        if (( $${#lora_args[@]} )); then
+          args+=(--lora-modules "$${lora_args[@]}")
+        fi
+        echo "[vllm-entrypoint] vllm serve $${args[*]}"
+        exec vllm serve "$${args[@]}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # First boot downloads ~6 GB of weights and compiles kernels.
+      start_period: 900s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # profile cpu: Ollama as a CPU dev backend (OpenAI-compatible /v1 API).
+  # Set in .env: T2S_LLM_BASE_URL=http://ollama:11434/v1, T2S_BASE_MODEL=qwen2.5:3b
+  # (make up-cpu does this for you). No LoRA support: prompt/rag modes only.
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.1}
+    profiles: ["cpu"]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      # Same context window as vLLM (--max-model-len) so prompts are comparable.
+      OLLAMA_CONTEXT_LENGTH: "4096"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # One-shot: pulls the model once Ollama is up (no-op when already present).
+  ollama-pull:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.40.1}
+    profiles: ["cpu"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${OLLAMA_MODEL:-qwen2.5:3b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # profile tracking: MLflow server (SQLite backend + proxied local artifacts).
+  # Host-side training/eval: export MLFLOW_TRACKING_URI=http://localhost:5000
+  # ---------------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.17.0
+    profiles: ["tracking"]
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    environment:
+      # MLflow validates the Host header (DNS-rebinding protection). Allow the
+      # host (localhost) and other compose services (http://mlflow:5000).
+      MLFLOW_SERVER_ALLOWED_HOSTS: "localhost,localhost:*,127.0.0.1,127.0.0.1:*,mlflow,mlflow:*"
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --artifacts-destination
+      - /mlflow/artifacts
+      - --serve-artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  hf-cache:
+  vllm-cache:
+  ollama-models:
+  mlflow-data:

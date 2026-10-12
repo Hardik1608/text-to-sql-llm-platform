@@ -1,0 +1,16 @@
+# Grafana datasource provisioning. Dashboards reference this datasource by its
+# fixed uid ("prometheus"), so they work without any manual setup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Must match the Prometheus scrape_interval; $__rate_interval derives from it.
+      timeInterval: 15s
+      httpMethod: POST

@@ -1,0 +1,152 @@
+# =============================================================================
+# Alerting rules - Text-to-SQL platform
+# Validate: promtool check rules infra/alerts.yml
+# Severity: critical = user-facing outage (page), warning = degradation (ticket)
+# Firing alerts: http://localhost:9090/alerts
+# =============================================================================
+groups:
+  # ---------------------------------------------------------------------------
+  # API gateway: availability, latency SLO, error budget, LLM backend, cache
+  # ---------------------------------------------------------------------------
+  - name: text2sql-api
+    rules:
+      - alert: Text2SQLApiDown
+        expr: up{job="text2sql-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: text2sql-api
+        annotations:
+          summary: Text-to-SQL API is down
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for more than 1 minute.
+            Check `docker compose ps api` and `docker compose logs api`.
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+      - alert: Text2SQLHighLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, mode) (rate(text2sql_request_latency_seconds_bucket[5m]))
+          ) > 4
+        for: 10m
+        labels:
+          severity: warning
+          service: text2sql-api
+        annotations:
+          summary: "P95 latency above 4s (mode={{ $labels.mode }})"
+          description: >-
+            End-to-end P95 latency for mode={{ $labels.mode }} is {{ $value | humanizeDuration }}
+            (threshold 4s) for 10 minutes. Check the stage-latency panel (retrieval / generation /
+            validation / execution) and the vLLM queue.
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+      # Rejections (SQL validator) + execution errors + LLM errors over all
+      # requests. cannot_answer is a legitimate abstention, not an error.
+      # The volume guard avoids paging on 1-of-2 failures at near-zero traffic.
+      - alert: Text2SQLHighFailureRatio
+        expr: |
+          (
+            sum by (mode) (rate(text2sql_requests_total{status=~"rejected|exec_error|llm_error"}[10m]))
+            /
+            sum by (mode) (rate(text2sql_requests_total[10m]))
+          ) > 0.10
+          and
+          sum by (mode) (increase(text2sql_requests_total[10m])) >= 10
+        for: 10m
+        labels:
+          severity: warning
+          service: text2sql-api
+        annotations:
+          summary: "More than 10% of requests fail (mode={{ $labels.mode }})"
+          description: >-
+            {{ $value | humanizePercentage }} of mode={{ $labels.mode }} requests ended as
+            rejected / exec_error / llm_error over the last 10 minutes. Break down by status and
+            by validation-failure reason on the dashboard; a jump right after an adapter load
+            points at the adapter.
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+      - alert: Text2SQLLLMErrorsSpike
+        expr: sum by (kind) (increase(text2sql_llm_errors_total[5m])) > 5
+        for: 2m
+        labels:
+          severity: critical
+          service: text2sql-api
+        annotations:
+          summary: "LLM backend errors spiking (kind={{ $labels.kind }})"
+          description: >-
+            {{ $value | printf "%.0f" }} LLM {{ $labels.kind }} errors in the last 5 minutes.
+            timeout: backend overloaded (see vLLM queue); connection: backend down or
+            T2S_LLM_BASE_URL wrong; http_error: bad model/adapter name or backend 5xx.
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+      # `or vector(0)`: with zero hits the hit series may not exist yet; the
+      # ratio must then be 0, not absent. Errors count as non-hits.
+      - alert: Text2SQLLowCacheHitRatio
+        expr: |
+          (
+            (sum(rate(text2sql_cache_requests_total{result="hit"}[30m])) or vector(0))
+            /
+            sum(rate(text2sql_cache_requests_total[30m]))
+          ) < 0.10
+          and
+          sum(increase(text2sql_cache_requests_total[30m])) >= 50
+        for: 30m
+        labels:
+          severity: warning
+          service: text2sql-api
+        annotations:
+          summary: Query cache hit ratio below 10%
+          description: >-
+            Cache hit ratio is {{ $value | humanizePercentage }} over the last 30 minutes.
+            Expected for one-off evaluation runs; otherwise check result="error" (Redis
+            unreachable), the TTL (T2S_CACHE_TTL_SECONDS) and evictions (256 MB LRU).
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+  # ---------------------------------------------------------------------------
+  # Redis cache backing store
+  # ---------------------------------------------------------------------------
+  - name: redis
+    rules:
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: redis
+        annotations:
+          summary: Redis cache is unreachable
+          description: >-
+            redis_exporter cannot reach Redis. The API keeps serving without the cache
+            (higher latency and LLM load); check `docker compose logs redis`.
+
+  # ---------------------------------------------------------------------------
+  # vLLM inference server (only scraped when the gpu profile is running)
+  # ---------------------------------------------------------------------------
+  - name: vllm
+    rules:
+      - alert: VLLMDown
+        expr: up{job="vllm"} == 0
+        for: 3m
+        labels:
+          severity: critical
+          service: vllm
+        annotations:
+          summary: vLLM server is down
+          description: >-
+            vLLM target {{ $labels.instance }} has not answered /metrics for 3 minutes. On a
+            cold start this can be the model download/load; see `docker compose logs vllm`.
+          dashboard: http://localhost:3000/d/text2sql-overview
+
+      - alert: VLLMQueueBacklog
+        expr: sum by (instance, model_name) (vllm:num_requests_waiting) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: vllm
+        annotations:
+          summary: vLLM request queue backlog
+          description: >-
+            {{ $value | printf "%.0f" }} requests waiting in the vLLM scheduler queue for
+            5 minutes. The GPU is saturated: check KV-cache usage, lower max-model-len,
+            or add capacity.
+          dashboard: http://localhost:3000/d/text2sql-overview

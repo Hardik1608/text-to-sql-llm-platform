@@ -1,0 +1,55 @@
+# =============================================================================
+# Prometheus - Text-to-SQL platform
+# Validate: promtool check config infra/prometheus.yml   (also checks rule files)
+# Reload:   docker compose kill -s SIGHUP prometheus
+# =============================================================================
+global:
+  scrape_interval: 15s       # keep in sync with Grafana datasource timeInterval
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    project: text2sql
+    environment: local
+
+rule_files:
+  - alerts.yml               # resolved relative to this file (/etc/prometheus)
+
+# No Alertmanager in the local stack: firing alerts are visible at
+# http://localhost:9090/alerts. To route them, add an alertmanager service and:
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # FastAPI gateway (prometheus_client): text2sql_* metrics.
+  - job_name: text2sql-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  # vLLM engine metrics (vllm:* - queue depth, KV-cache, TTFT, token rates).
+  # DNS service discovery instead of a static target: when the gpu profile is
+  # not running, the name "vllm" does not resolve (NXDOMAIN), so the job has
+  # zero targets instead of a permanently-down one. VLLMDown therefore only
+  # fires when vLLM is deployed but not serving.
+  - job_name: vllm
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ["vllm"]
+        type: A
+        port: 8000
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: [__meta_dns_name]
+        target_label: instance
+        replacement: "${1}:8000"
+
+  # Redis cache health via oliver006/redis_exporter (redis_* metrics).
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
