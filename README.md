@@ -1,14 +1,24 @@
 # Text-to-SQL LLM Platform
 
-> Measures when prompting, retrieval (RAG) and QLoRA fine-tuning pay off for Text-to-SQL.
-> Qwen2.5-3B on one RTX 3060: **63.4% → 76.1%** execution accuracy on the
-> [Spider](https://yale-lily.github.io/spider) test set, served on vLLM behind a SQL safety layer.
-
-https://github.com/user-attachments/assets/06fd9b75-4927-486c-bb74-6bb133ed5423
+**Natural-language questions → safe SQL, with a measured answer to "prompting, RAG or
+fine-tuning?". A 3B open model, fine-tuned and served on one 12 GB consumer GPU.**
 
 [![CI](https://github.com/Hardik1608/text-to-sql-llm-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Hardik1608/text-to-sql-llm-platform/actions)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+- **63.4% → 76.1%** execution accuracy on the [Spider](https://yale-lily.github.io/spider)
+  test set (2,147 unseen questions): QLoRA fine-tuning **+9.5 pts**, schema RAG +3.2 pts on top.
+- **6.1 queries/s** on vLLM at 16 parallel requests (**5×** single-request throughput), same accuracy.
+- **4-stage SQL safety layer:** read-only by construction, **0.01%** false rejections on 9,693
+  gold queries, ~4 ms per check.
+- **Validation loss picked the wrong checkpoint:** the lowest-loss one scored 8 points lower, so
+  the final weights are served.
+
+https://github.com/user-attachments/assets/06fd9b75-4927-486c-bb74-6bb133ed5423
+
+**Stack:** Qwen2.5-3B · PEFT/QLoRA · TRL · vLLM (per-request LoRA) · BM25 RAG · sqlglot ·
+FastAPI · Redis · MLflow · Prometheus/Grafana · Docker Compose · GitHub Actions
 
 ## Documentation
 | | |
@@ -88,8 +98,10 @@ ran on one RTX 3060. No repair retries were used.
 
 For scale: the best GPT-4-based systems score about 86% on the same test set
 ([DAIL-SQL](https://arxiv.org/abs/2308.15363): 86.6%). This project uses a 3B open model that is
-trained and served on one 12 GB consumer GPU. Spider 1.0 is close to saturated, so
-[BIRD](https://bird-bench.github.io/) is the next benchmark for this pipeline.
+trained and served on one 12 GB consumer GPU. Spider 1.0 is close to saturated; this
+pipeline's single-shot mode is the baseline on [BIRD](https://bird-bench.github.io/) in the
+follow-up project, [governed-data-agent](https://github.com/Hardik1608/governed-data-agent)
+(49.1% single-shot vs 55.9% for the agent on all 1,534 BIRD dev questions).
 
 | Serving on vLLM (one RTX 3060, QLoRA + RAG, 500 dev questions) | Throughput | P50 | P95 | Exec Acc |
 |---|---|---|---|---|
